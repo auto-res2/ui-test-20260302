@@ -1,0 +1,36 @@
+# A-SC2: Adaptive Self-Consistency with Early Exit
+# Proposed method with adaptive sampling based on decision stability
+
+run_id: proposed-gemini-gsm8k
+
+method:
+  type: adaptive-sc
+  name: A-SC2
+  description: Adaptive self-consistency with confidence- and cost-regularized early exit
+  
+  # Sequential sampling parameters
+  k_max: 20  # Maximum samples to generate
+  temperature: 0.7  # Sampling temperature
+  
+  # Early-exit thresholds
+  margin_threshold: 0.5  # Stop if top answer margin >= this
+  entropy_threshold: 0.3  # Stop if normalized entropy <= this
+  min_samples: 2  # Minimum samples before allowing early exit
+  
+  # Weighted aggregation parameters
+  lambda_length: 0.01  # Length penalty coefficient
+  epsilon: 0.01  # Small constant for low-confidence weighting
+
+model:
+  name: gemini-2.0-flash-exp
+  provider: google
+  api_key_env: GOOGLE_API_KEY
+
+dataset:
+  name: gsm8k
+  split_train: train[:50]  # Dev set for tuning
+  split_test: test[:200]  # Test set for evaluation
+  
+inference:
+  max_tokens: 512
+  cot_prompt: "Let's solve this step by step:"

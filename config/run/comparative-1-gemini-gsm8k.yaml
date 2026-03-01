@@ -1,0 +1,27 @@
+# Baseline: Fixed Self-Consistency with k=10
+# Standard self-consistency with higher fixed sample budget
+
+run_id: comparative-1-gemini-gsm8k
+
+method:
+  type: fixed-sc
+  name: SC-10
+  description: Fixed self-consistency with k=10 samples
+  
+  # Fixed sampling parameters
+  k_fixed: 10
+  temperature: 0.7
+
+model:
+  name: gemini-2.0-flash-exp
+  provider: google
+  api_key_env: GOOGLE_API_KEY
+
+dataset:
+  name: gsm8k
+  split_train: train[:50]
+  split_test: test[:200]
+  
+inference:
+  max_tokens: 512
+  cot_prompt: "Let's solve this step by step:"
