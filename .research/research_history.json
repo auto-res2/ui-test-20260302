@@ -107,5 +107,146 @@
     "experimental_code": "import re, math\nfrom collections import defaultdict\n\ndef extract_final_number(text: str):\n    m = re.findall(r\"####\\s*(-?\\d+(?:\\.\\d+)?)\", text)\n    if m:\n        return m[-1]\n    nums = re.findall(r\"-?\\d+(?:\\.\\d+)?\", text)\n    return nums[-1] if nums else None\n\ndef approx_len_words(text: str) -> int:\n    return len(text.strip().split())\n\ndef verifier_flag(question: str, rationale: str, call_llm):\n    v_prompt = (\n        \"You are a consistency checker.\\n\"\n        \"Question:\\n\" + question + \"\\n\\n\"\n        \"Rationale:\\n\" + rationale + \"\\n\\n\"\n        \"Does the rationale contradict the question facts or itself?\\n\"\n        \"Answer with exactly one word: CONSISTENT or INCONSISTENT.\"\n    )\n    v = call_llm(v_prompt, temperature=0.0, max_tokens=3)\n    v_up = v.upper()\n    return 1 if (\"CONSISTENT\" in v_up and \"INCONSISTENT\" not in v_up) else 0\n\ndef weighted_distribution(scores: dict):\n    total = sum(scores.values())\n    if total <= 0:\n        return {}\n    return {a: s/total for a, s in scores.items()}\n\ndef entropy(probs: dict) -> float:\n    h = 0.0\n    for p in probs.values():\n        if p > 0:\n            h -= p * math.log(p + 1e-12)\n    return h\n\ndef top2_margin(probs: dict) -> float:\n    if not probs:\n        return 0.0\n    ps = sorted(probs.values(), reverse=True)\n    if len(ps) == 1:\n        return ps[0]\n    return ps[0] - ps[1]\n\n# --- Proposed: Adaptive Self-Consistency with Confidence- & Cost-Regularized Early Exit (A-SC2) ---\n\ndef asc2_answer(question: str,\n               call_llm,\n               K_max: int = 20,\n               lam: float = 0.01,\n               eps: float = 0.1,\n               tau: float = 0.20,\n               h0: float = 0.60,\n               temperature: float = 0.7,\n               max_tokens: int = 512):\n    base_prompt = (\n        \"Solve the problem. Use brief, high-signal reasoning. \"\n        \"If you can, keep it short. Then give the final answer as '#### <number>'.\\n\\n\"\n        + question\n    )\n\n    scores = defaultdict(float)\n    for i in range(1, K_max + 1):\n        out = call_llm(base_prompt, temperature=temperature, max_tokens=max_tokens)\n        ans = extract_final_number(out)\n        if ans is None:\n            continue\n        L = approx_len_words(out)\n        c = verifier_flag(question, out, call_llm)\n        w = math.exp(-lam * L) * (eps + c)\n        scores[ans] += w\n\n        probs = weighted_distribution(scores)\n        m = top2_margin(probs)\n        h = entropy(probs)\n        if m >= tau or h <= h0:\n            break\n\n    if not scores:\n        return None\n    return max(scores.items(), key=lambda kv: kv[1])[0]\n\n# --- Baseline: fixed-k majority self-consistency ---\n\ndef sc_majority_answer(question: str, call_llm, k: int = 10,\n                       temperature: float = 0.7, max_tokens: int = 512):\n    prompt = (\n        \"Solve the problem. Show your reasoning, then give the final answer as '#### <number>'.\\n\\n\"\n        + question\n    )\n    counts = defaultdict(int)\n    for _ in range(k):\n        out = call_llm(prompt, temperature=temperature, max_tokens=max_tokens)\n        ans = extract_final_number(out)\n        if ans is not None:\n            counts[ans] += 1\n    if not counts:\n        return None\n    return max(counts.items(), key=lambda kv: kv[1])[0]\n\n# Note: user provides call_llm(prompt, temperature, max_tokens).",
     "expected_result": "Across 200-example subsets (per dataset), compared to fixed-k self-consistency (k=10):\n- Accuracy: +1 to +4 points on GSM8K and SVAMP; neutral to +2 on StrategyQA (where long CoT can overfit/hallucinate).\n  Example expectation (API LLM):\n  - GSM8K: SC(10) 74–78% → A-SC2 77–81%.\n  - SVAMP: SC(10) 68–74% → A-SC2 71–76%.\n- Token cost: 25–45% fewer generated tokens on average vs SC(10) because many items stop early once margin is high.\n- Accuracy_per_1k_tokens: +30–70% relative improvement.\n- Answer_instability: decreases by ~10–25% (fewer problems with divergent sampled answers after weighting and early exit).\n\nHigher is better for accuracy and accuracy_per_1k_tokens; lower is better for avg_tokens_generated and answer_instability.",
     "expected_conclusion": "A-SC2 supports a more human-like “stop when confident” reasoning policy under strict prompt-only constraints. By making self-consistency sequential and explicitly optimizing decision stability (margin/entropy) while regularizing verbose/inconsistent chains, it yields a better accuracy–cost frontier than fixed-budget CoT. Academically, it reframes prompt-only CoT as an adaptive inference/control problem with measurable stability signals, broadening evaluation beyond raw accuracy. Practically and socially, it reduces inference cost/latency and lowers the chance that spurious long rationales dominate decisions, enabling more efficient and reliable deployment without fine-tuning."
+  },
+  "experimental_design": {
+    "experiment_summary": "Task: given a natural-language grade-school math word problem, the model must produce the correct final numeric answer. We evaluate whether a prompt-only *adaptive* self-consistency policy (A-SC2) improves (i) correctness and (ii) accuracy per generated token by deciding, per instance, when to stop sampling additional chain-of-thought (CoT) traces based on decision stability.\n\nWorkflow:\n1) For each GSM8K test item, run an inference policy that may sample the base model multiple times (temperature>0) and aggregates extracted final answers.\n2) Baseline policy uses fixed-budget self-consistency: sample k CoTs, take majority vote (or weighted vote).\n3) Proposed A-SC2 samples sequentially up to K_max, updates a *weighted* answer distribution, computes stability (top-2 margin / entropy), and early-exits when sufficiently confident; otherwise continues sampling.\n4) Record: final predicted answer, number of samples used, generated token count, and intermediate answer diversity.\n5) Tune only the inference hyperparameters (τ, h0, λ) on a small held-out dev slice from GSM8K-train; evaluate once on a fixed GSM8K-test subset.\n\nScale to fit Runner (H200 140GB): single-model, inference-only. Use GSM8K with 200 test examples for the main run + 50 dev examples for tuning. Use a single open/available API model (Gemini 2.5 Flash) to avoid loading large local weights; total calls bounded by K_max=20 but typically early-exit at ~3–8 samples, keeping runtime/cost practical. Token logging uses provider usage fields where available; otherwise approximate via tokenizer (tiktoken-like) for reproducibility.",
+    "runner_config": {
+      "runner_label": [
+        "self-hosted",
+        "gpu-runner"
+      ],
+      "description": "NVIDIA H200, VRAM: 140 GB, RAM: 240 GB"
+    },
+    "evaluation_metrics": [
+      {
+        "name": "accuracy",
+        "description": "Correctness criteria: For each problem, extract a numeric final answer from the model output. A prediction is correct if it matches the reference answer numerically within tolerance. For GSM8K, the canonical reference is an integer; treat both as decimals and compare |pred-ref| <= 1e-6 after stripping commas and trailing zeros. If extraction fails, count as incorrect.\n\nCalculation method: accuracy = (# correct predictions) / N, where N is the number of evaluated examples.\n\nTask appropriateness: GSM8K is a numeric word-problem benchmark where the primary goal is exact final-answer correctness; accuracy directly measures success.\n\nRelevant visualizations: (1) Bar chart of accuracy by method. (2) Scatter plot of per-item correctness (0/1) vs generated tokens to show where gains occur."
+      },
+      {
+        "name": "avg_tokens_generated",
+        "description": "Correctness criteria: Not applicable (cost metric).\n\nCalculation method: For each example, sum all *generated* tokens across all model calls made by the policy (including verifier calls, if enabled). avg_tokens_generated = (1/N) * Σ_i tokens_i. If the API returns usage.generated_tokens, use it; else approximate by tokenizing the generated text with a fixed tokenizer.\n\nTask appropriateness: The hypothesis targets reduced cost/latency and improved accuracy-per-token via early exit.\n\nRelevant visualizations: (1) Box/violin plot of tokens per example by method. (2) CDF of tokens per example to show tail behavior."
+      },
+      {
+        "name": "accuracy_per_1k_tokens",
+        "description": "Correctness criteria: inherits correctness from the accuracy definition.\n\nCalculation method: accuracy_per_1k_tokens = 1000 * (# correct) / (Σ_i tokens_i). This reports correct answers per 1000 generated tokens (higher is better). If tokens_i includes verifier tokens, the metric reflects end-to-end cost.\n\nTask appropriateness: Directly evaluates the accuracy–compute efficiency frontier central to A-SC2.\n\nRelevant visualizations: (1) Accuracy vs avg_tokens_generated trade-off curve by sweeping τ (and optionally h0). (2) Pareto frontier plot with methods as points."
+      },
+      {
+        "name": "answer_instability_first5",
+        "description": "Correctness criteria: Not a correctness metric; measures decision instability under sampling.\n\nCalculation method: For each problem, collect extracted final answers from the *first 5* sampled CoT generations (ignoring verifier calls). Let U be the number of distinct extracted answers among those 5 (excluding None). Define unstable = 1 if U >= 2 else 0. answer_instability_first5 = (1/N) * Σ_i unstable_i.\n\nTask appropriateness: The hypothesis claims that calibrated/adaptive reasoning reduces answer instability induced by unnecessary long CoT and spurious steps.\n\nRelevant visualizations: (1) Bar chart of instability rate by method. (2) Histogram of U (# unique answers) across items."
+      },
+      {
+        "name": "early_exit_rate",
+        "description": "Correctness criteria: Not applicable.\n\nCalculation method: For adaptive methods only: early_exit_rate = (# examples where samples_used < K_max) / N. Also report mean samples_used.\n\nTask appropriateness: Validates that the stopping rule is actively allocating compute rather than always running to K_max.\n\nRelevant visualizations: (1) Histogram of samples_used. (2) Samples_used vs correctness scatter (jittered) to see whether extra sampling helps hard items."
+      }
+    ],
+    "models_to_use": [
+      "gemini-2.5-flash (~unknown params)"
+    ],
+    "datasets_to_use": [
+      "GSM8K"
+    ],
+    "proposed_method": {
+      "method_name": "A-SC2 (Adaptive Self-Consistency with Confidence- & Cost-Regularized Early Exit)",
+      "description": "Prompt-only adaptive self-consistency: sequentially sample CoT traces and maintain a weighted answer distribution where each vote is downweighted by rationale length (cost regularization) and upweighted by a cheap prompt-only consistency check. Stop early when the weighted distribution is stable (top-2 margin ≥ τ or entropy ≤ h0), otherwise continue up to K_max. Novelty: compute allocation and stopping are explicitly driven by decision stability, improving accuracy-per-token and robustness without any training.",
+      "optuna_config": {
+        "enabled": true,
+        "n_trials": 20,
+        "search_spaces": [
+          {
+            "param_name": "tau",
+            "distribution_type": "categorical",
+            "choices": [
+              0.1,
+              0.15,
+              0.2,
+              0.25,
+              0.3
+            ]
+          },
+          {
+            "param_name": "h0",
+            "distribution_type": "categorical",
+            "choices": [
+              0.2,
+              0.4,
+              0.6,
+              0.8
+            ]
+          },
+          {
+            "param_name": "lam",
+            "distribution_type": "loguniform",
+            "low": 0.0005,
+            "high": 0.05
+          },
+          {
+            "param_name": "K_max",
+            "distribution_type": "categorical",
+            "choices": [
+              10,
+              15,
+              20
+            ]
+          },
+          {
+            "param_name": "temperature",
+            "distribution_type": "categorical",
+            "choices": [
+              0.5,
+              0.7,
+              0.9
+            ]
+          },
+          {
+            "param_name": "eps",
+            "distribution_type": "categorical",
+            "choices": [
+              0.05,
+              0.1,
+              0.2
+            ]
+          }
+        ]
+      }
+    },
+    "comparative_methods": [
+      {
+        "method_name": "Self-Consistency Majority Vote (fixed-k)",
+        "description": "Standard prompt-only self-consistency: sample k independent CoT generations with temperature>0 using a fixed prompt, extract the final answer from each, and output the majority-vote answer. Compute cost is fixed per instance (k), with no explicit stability-based early stopping or length/consistency weighting.",
+        "optuna_config": {
+          "enabled": true,
+          "n_trials": 20,
+          "search_spaces": [
+            {
+              "param_name": "k",
+              "distribution_type": "categorical",
+              "choices": [
+                5,
+                10,
+                15,
+                20
+              ]
+            },
+            {
+              "param_name": "temperature",
+              "distribution_type": "categorical",
+              "choices": [
+                0.5,
+                0.7,
+                0.9
+              ]
+            },
+            {
+              "param_name": "max_tokens",
+              "distribution_type": "categorical",
+              "choices": [
+                256,
+                512
+              ]
+            }
+          ]
+        }
+      }
+    ]
   }
 }
